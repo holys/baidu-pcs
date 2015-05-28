@@ -13,6 +13,11 @@ func main() {
 		panic("token not found")
 	}
 	client := pcs.NewClient(token)
-	fmt.Println(client.baseURL)
+	quota, err := client.GetQuota()
+	if err != nil {
+		return
+	}
+
+	fmt.Printf("%v\n", quota)
 
 }

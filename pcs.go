@@ -438,7 +438,7 @@ type Pair struct {
 	To   string `json:"to"`
 }
 
-func (c *Client) batchGeneric(method string, args ...interface{}) (*http.Response, []byte, error) {
+func (c *Client) batchGeneric(method string, args interface{}) (*http.Response, []byte, error) {
 	c.baseURL.Path = filepath.Join(c.baseURL.Path, "file")
 
 	c.query.Set("method", method)
@@ -451,14 +451,14 @@ func (c *Client) batchGeneric(method string, args ...interface{}) (*http.Respons
 		tmp := struct {
 			List []*Pair `json:"list"`
 		}{
-			List: args,
+			List: args.([]*Pair),
 		}
 		param, err = json.Marshal(&tmp)
 	case "delete":
 		tmp := struct {
 			List []string `json:"list"`
 		}{
-			List: args,
+			List: args.([]string),
 		}
 		param, err = json.Marshal(&tmp)
 	}
@@ -474,7 +474,7 @@ func (c *Client) batchGeneric(method string, args ...interface{}) (*http.Respons
 
 // 批量移动文件/目录
 func (c *Client) BatchMove(pairs []*Pair) error {
-	_, data, err := c.batchGeneric(pairs, "move")
+	_, data, err := c.batchGeneric("move", pairs)
 	if err != nil {
 		return err
 	}
@@ -486,7 +486,7 @@ func (c *Client) BatchMove(pairs []*Pair) error {
 
 // 批量拷贝文件/目录
 func (c *Client) BatchCopy(pairs []*Pair) error {
-	_, data, err := c.batchGeneric(pairs, "copy")
+	_, data, err := c.batchGeneric("copy", pairs)
 	if err != nil {
 		return err
 	}
