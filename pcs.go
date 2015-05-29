@@ -253,7 +253,8 @@ func (c *Client) Download(path string) error {
 	c.query.Set("path", path)
 	c.downloadURL.RawQuery = c.query.Encode()
 
-	_, _, err := c.client.Get(c.downloadURL.String())
+	_, data, err := c.client.Get(c.downloadURL.String())
+	fmt.Println(string(data))
 	return err
 }
 
@@ -361,8 +362,10 @@ func (c *Client) ListFiles(path, order, by, limit string) ([]*File, error) {
 	c.query.Set("path", path)
 	c.query.Set("by", by)
 	c.query.Set("limit", limit)
+	c.query.Set("order", order)
 	c.baseURL.RawQuery = c.query.Encode()
-	_, data, err := c.client.PostForm(c.baseURL.String(), nil)
+	fmt.Println(c.baseURL.String())
+	_, data, err := c.client.Get(c.baseURL.String())
 	if err != nil {
 		return nil, err
 	}
@@ -544,21 +547,73 @@ func (c *Client) Search(path string, word string, recursive bool) ([]*File, erro
 // **高级功能**
 
 //获取指定图片文件的缩略图。
-func (c *Client) Thumbnail() error {
+// path: 源图片的路径。                               必选
+// height: 指定缩略图的高度，取值范围为(0,1600]。       必选
+// width: 指定缩略图的高度，取值范围为(0,1600]。        必选
+// quality: 缩略图的质量，默认为“100”，取值范围(0,100]。可选
+func (c *Client) Thumbnail(path string, height int, width int, quality int) error {
 	c.baseURL.Path = filepath.Join(c.baseURL.Path, "thumbnail")
+
+	c.query.Set("method", "generate")
+	c.query.Set("path", path)
+	c.query.Set("height", strconv.FormatInt(int64(height), 10))
+	c.query.Set("width", strconv.FormatInt(int64(width), 10))
+	c.query.Set("quality", strconv.FormatInt(int64(quality), 10))
+	c.baseURL.RawQuery = c.query.Encode()
+
+	_, data, err := c.client.Get(c.baseURL.String())
+	if err != nil {
+		return err
+	}
+
+	fmt.Println(string(data))
+	// TODO: 返回值？
 
 	return nil
 
 }
 
 // 增量更新查询
-func (c *Client) Diff() error {
+// cursor: 用于标记更新断点。
+//  - 首次调用cursor=null；
+//  - 非首次调用，使用最后一次调用diff接口的返回结果中的cursor。
+func (c *Client) Diff(cursor string) error {
+	c.baseURL.Path = filepath.Join(c.baseURL.Path, "file")
+
+	c.query.Set("method", "diff")
+	c.query.Set("cursor", cursor)
+
+	c.baseURL.RawQuery = c.query.Encode()
+
+	_, data, err := c.client.Get(c.baseURL.String())
+	if err != nil {
+		return err
+	}
+
+	fmt.Println(string(data))
+	// TODO: unmarshal result
 
 	return nil
 }
 
 // 为当前用户进行视频转码并实现在线实时观看
+// path: 格式必须为m3u8,m3u,asf,avi,flv,gif,mkv,mov,mp4,m4a,3gp,3g2,mj2,mpeg,ts,rm,rmvb,webm
+// typ: 目前支持以下格式：
+//      M3U8_320_240、M3U8_480_224、M3U8_480_360、M3U8_640_480和M3U8_854_480
 func (c *Client) Streaming(path, typ string) error {
+	c.baseURL.Path = filepath.Join(c.baseURL.Path, "file")
+
+	c.query.Set("method", "streaming")
+	c.query.Set("path", path)
+	c.query.Set("type", typ)
+	c.baseURL.RawQuery = c.query.Encode()
+
+	_, data, err := c.client.Get(c.baseURL.String())
+	if err != nil {
+		return err
+	}
+
+	fmt.Println(string(data))
 
 	return nil
 }
