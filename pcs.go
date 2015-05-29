@@ -101,7 +101,7 @@ type File struct {
 	IsDir uint   `json:"isdir"` // 是否是目录的标识符: “0”为文件, “1”为目录
 }
 
-// path: 待上传文件的相对路径
+// path: 待上传文件的或者绝对路径/相对路径
 func (c *Client) upload(path string) (io.Reader, string, error) {
 	// code adapted from http://matt.aimonetti.net/posts/2013/07/01/golang-multipart-file-upload-example/
 	fullpath, err := filepath.Abs(path)
@@ -152,8 +152,8 @@ func getOnDup(overwrite bool) string {
 }
 
 // 上传单个文件
-// srcPath: 上传文件的源路径
-// targetPath: 上传文件的目标保存路径
+// srcPath: 待上传文件的或者绝对路径/相对路径
+// targetPath: 上传文件路径（含上传的文件名称)。
 func (c *Client) Upload(srcPath, targetPath string, overwrite bool) (*File, error) {
 	c.uploadURL.Path = filepath.Join(c.uploadURL.Path, "file")
 

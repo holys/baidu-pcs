@@ -2,6 +2,8 @@ package pcs
 
 import (
 	"crypto/tls"
+	"encoding/json"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"net"
@@ -66,12 +68,36 @@ func (c *HttpClient) Do(req *http.Request) (*http.Response, []byte, error) {
 		return nil, nil, err
 	}
 
-	if res.StatusCode != http.StatusOK {
-		// return error.
-
+	err = CheckResponse(body, res)
+	if err != nil {
+		// even though there was an error, we still return the response
+		// in case the caller wants to inspect it further
+		return res, body, err
 	}
 
-	// marshal error.
-
 	return res, body, nil
+}
+
+type ErrorResponse struct {
+	Response *http.Response // HTTP response that caused this error
+	Message  string         `json:"error_msg"`  // error message
+	Code     int            `json:"error_code"` // error code
+}
+
+func (r *ErrorResponse) Error() string {
+	return fmt.Sprintf("[%v] - %v - %d - %v - %d",
+		r.Response.Request.Method, r.Response.Request.URL,
+		r.Response.StatusCode, r.Message, r.Code)
+}
+
+func CheckResponse(body []byte, r *http.Response) error {
+	// FIXME: what if 3XX?
+	if c := r.StatusCode; 200 <= c && c <= 299 {
+		return nil
+	}
+	errorResponse := &ErrorResponse{Response: r}
+	if body != nil {
+		json.Unmarshal(body, errorResponse)
+	}
+	return errorResponse
 }
