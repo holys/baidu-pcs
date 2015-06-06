@@ -1,20 +1,20 @@
 package pcs
 
 import (
-	"bytes"
-	"crypto/md5"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"hash/crc32"
 	"io"
-	"mime/multipart"
+	"io/ioutil"
+	"net"
 	"net/http"
 	"net/url"
-	"os"
-	"path/filepath"
-	"strconv"
+	"reflect"
 	"strings"
+	"time"
+
+	"github.com/google/go-querystring/query"
 )
 
 const (
@@ -22,7 +22,12 @@ const (
 	uploadBaseURL   = "https://c.pcs.baidu.com/rest/2.0/pcs"
 	downloadBaseURL = "https://d.pcs.baidu.com/rest/2.0/pcs"
 
+	libraryVersion = "0.1"
+	userAgent      = "go-baidupcs/" + libraryVersion
+
 	minRapidUploadFile = 256 * 1024
+
+	defaultIdleConns = 128
 )
 
 var (
@@ -41,12 +46,13 @@ var (
 // 文件名或路径名开头结尾不能是“.”或空白字符，空白字符包括: \r, \n, \t, 空格, \0, \x0B
 
 type Client struct {
-	baseURL     *url.URL
-	uploadURL   *url.URL
-	downloadURL *url.URL
+	BaseURL     *url.URL
+	UploadURL   *url.URL
+	DownloadURL *url.URL
 
-	client *HttpClient
-	query  url.Values
+	UserAgent   string
+	AccessToken string
+	client      *http.Client
 }
 
 func NewClient(accessToken string) *Client {
@@ -56,884 +62,182 @@ func NewClient(accessToken string) *Client {
 	uploadURL, _ := url.Parse(uploadBaseURL)
 	downloadURL, _ := url.Parse(downloadBaseURL)
 
-	client.baseURL = baseURL
-	client.uploadURL = uploadURL
-	client.downloadURL = downloadURL
+	client.BaseURL = baseURL
+	client.UploadURL = uploadURL
+	client.DownloadURL = downloadURL
+
+	client.UserAgent = userAgent
+	client.AccessToken = accessToken
 	client.client = NewHttpClient()
-	client.query = url.Values{}
-	client.query.Set("access_token", accessToken)
 
 	return client
 }
 
-type Quota struct {
-	Quota uint64 `json:"quota"`
-	Used  uint64 `json:"used"`
+func NewHttpClient() *http.Client {
+	tr := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		Dial: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).Dial,
+		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
+		TLSHandshakeTimeout: 10 * time.Second,
+		MaxIdleConnsPerHost: defaultIdleConns,
+	}
+	return &http.Client{Transport: tr}
 }
 
-// 获取当前用户空间配额信息
-func (c *Client) GetQuota() (*Quota, error) {
-	c.baseURL.Path = filepath.Join(c.baseURL.Path, "quota")
-	c.query.Set("method", "info")
-	c.baseURL.RawQuery = c.query.Encode()
-
-	_, body, err := c.client.Get(c.baseURL.String())
+func (c *Client) Get(url string, v interface{}) (*http.Response, error) {
+	req, err := c.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, err
 	}
-
-	q := new(Quota)
-	err = json.Unmarshal(body, q)
-	if err != nil {
-		return nil, err
-	}
-
-	return q, nil
+	return c.Do(req, v)
 }
 
-type File struct {
-	Path  string `json:"path"`  // 文件的绝对路径
-	Size  uint64 `json:"size"`  // 文件大小（以字节为单位）
-	Ctime uint64 `json:"ctime"` // 文件创建时间
-	Mtime uint64 `json:"mtime"` // 文件修改时间
-	Md5   string `json:"md5"`   // 文件的md5签名
-	FsId  uint64 `json:"fs_id"` // 文件在PCS的临时唯一标识ID
-	IsDir uint   `json:"isdir"` // 是否是目录的标识符: “0”为文件, “1”为目录
+func (c *Client) Post(url string, contentType string, body io.Reader, v interface{}) (*http.Response, error) {
+	req, err := http.NewRequest("POST", url, body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", contentType)
+	return c.Do(req, v)
 }
 
-// path: 待上传文件的或者绝对路径/相对路径
-func (c *Client) upload(path string) (io.Reader, string, error) {
-	// code adapted from http://matt.aimonetti.net/posts/2013/07/01/golang-multipart-file-upload-example/
-	fullpath, err := filepath.Abs(path)
-	if err != nil {
-		return nil, "", err
-	}
-
-	file, err := os.Open(fullpath)
-	if err != nil {
-		return nil, "", err
-	}
-	defer file.Close()
-
-	body := &bytes.Buffer{}
-	writer := multipart.NewWriter(body)
-	part, err := writer.CreateFormFile("file", filepath.Base(path))
-	if err != nil {
-		return nil, "", err
-	}
-
-	written, err := io.Copy(part, file)
-	if err != nil {
-		return nil, "", err
-	}
-
-	contentType := writer.FormDataContentType()
-	writer.Close()
-
-	stat, err := file.Stat()
-	if err != nil {
-		return nil, "", err
-	}
-	if written != stat.Size() {
-		return nil, "", ErrIncompleteFile
-	}
-
-	return body, contentType, nil
+func (c *Client) PostForm(url string, data url.Values, v interface{}) (*http.Response, error) {
+	return c.Post(url, "application/x-www-form-urlencoded", strings.NewReader(data.Encode()), v)
 }
 
-func getOnDup(overwrite bool) string {
-	var ondup string
-	if overwrite {
-		ondup = "overwrite"
-	} else {
-		ondup = "newcopy"
+func (c *Client) addOptions(s string, method string, opt interface{}) (string, error) {
+	v := reflect.ValueOf(opt)
+	if v.Kind() == reflect.Ptr && v.IsNil() {
+		return s, nil
 	}
-	return ondup
+
+	u, err := url.Parse(s)
+	if err != nil {
+		return s, err
+	}
+
+	qs, err := query.Values(opt)
+	if err != nil {
+		return s, err
+	}
+
+	qs.Set("access_token", c.AccessToken)
+	qs.Set("method", method)
+
+	u.RawQuery = qs.Encode()
+	return u.String(), nil
 }
 
-// 上传单个文件
-// srcPath: 待上传文件的或者绝对路径/相对路径
-// targetPath: 上传文件路径（含上传的文件名称)。
-func (c *Client) Upload(srcPath, targetPath string, overwrite bool) (*File, error) {
-	c.uploadURL.Path = filepath.Join(c.uploadURL.Path, "file")
-
-	body, contentType, err := c.upload(srcPath)
+// NewRequest creates an API request. A relative URL can be provided in urlStr,
+// in which case it is resolved relative to the BaseURL of the Client.
+// Relative URLs should always be specified without a preceding slash.  If
+// specified, the value pointed to by body is JSON encoded and included as the
+// request body.
+func (c *Client) NewRequest(method, urlStr string, body io.Reader) (*http.Request, error) {
+	rel, err := url.Parse(urlStr)
 	if err != nil {
 		return nil, err
 	}
 
-	c.query.Set("method", "upload")
-	c.query.Set("path", targetPath)
-	c.query.Set("ondup", getOnDup(overwrite))
-	c.uploadURL.RawQuery = c.query.Encode()
+	u := c.BaseURL.ResolveReference(rel)
 
-	_, data, err := c.client.Post(c.uploadURL.String(), contentType, body)
+	req, err := http.NewRequest(method, u.String(), body)
 	if err != nil {
 		return nil, err
 	}
 
-	f := new(File)
-	err = json.Unmarshal(data, f)
-	if err != nil {
-		return nil, err
+	if c.UserAgent != "" {
+		req.Header.Add("User-Agent", c.UserAgent)
 	}
-
-	return f, nil
+	return req, nil
 }
 
-// 分片上传—文件分片及上传
-func (c *Client) BlockUpload(srcPath string) (*File, error) {
-	c.uploadURL.Path = filepath.Join(c.uploadURL.Path, "file")
-	body, contentType, err := c.upload(srcPath)
+func (c *Client) NewUploadRequest(method, urlStr string, body io.Reader) (*http.Request, error) {
+	rel, err := url.Parse(urlStr)
 	if err != nil {
 		return nil, err
 	}
 
-	c.query.Set("method", "upload")
-	c.query.Set("type", "tmpfile")
-	c.uploadURL.RawQuery = c.query.Encode()
-
-	_, data, err := c.client.Post(c.uploadURL.String(), contentType, body)
+	u := c.UploadURL.ResolveReference(rel)
+	req, err := http.NewRequest(method, u.String(), body)
 	if err != nil {
 		return nil, err
 	}
 
-	f := new(File)
-	err = json.Unmarshal(data, f)
-	if err != nil {
-		return nil, err
+	if c.UserAgent != "" {
+		req.Header.Add("User-Agent", c.UserAgent)
 	}
+	return req, nil
 
-	return f, nil
 }
 
-// 分片上传—合并分片文件
-// 与分片文件上传的upload方法配合使用，可实现超大文件（>2G）上传，同时也可用于断点续传的场景。
-func (c *Client) CreateSuperFile(targetPath string, md5 []string, overwrite bool) (*File, error) {
-	if len(md5) < 2 || len(md5) > 1024 {
-		return nil, ErrInvalidArgument
-	}
-
-	c.baseURL.Path = filepath.Join(c.baseURL.Path, "file")
-
-	tmp := make(map[string][]string)
-	tmp["blocklist"] = md5
-	param, err := json.Marshal(tmp)
+func (c *Client) NewDownloadRequest(method, urlStr string, body io.Reader) (*http.Request, error) {
+	rel, err := url.Parse(urlStr)
 	if err != nil {
 		return nil, err
 	}
 
-	c.query.Set("method", "createsuperfile")
-	c.query.Set("path", targetPath)
-	c.query.Set("ondup", getOnDup(overwrite))
-	c.baseURL.RawQuery = c.query.Encode()
-
-	d := url.Values{}
-	d.Set("param", string(param))
-
-	_, data, err := c.client.PostForm(c.baseURL.String(), d)
+	u := c.DownloadURL.ResolveReference(rel)
+	req, err := http.NewRequest(method, u.String(), body)
 	if err != nil {
 		return nil, err
 	}
 
-	f := new(File)
-	err = json.Unmarshal(data, f)
-	if err != nil {
-		return nil, err
+	if c.UserAgent != "" {
+		req.Header.Add("User-Agent", c.UserAgent)
 	}
-	return f, nil
+	return req, nil
+
 }
 
-// 下载单个文件
-// path: 下载文件路径，以/开头的绝对路径。
-func (c *Client) Download(path string) error {
-	c.downloadURL.Path = filepath.Join(c.downloadURL.Path, "file")
-
-	c.query.Set("method", "download")
-	c.query.Set("path", path)
-	c.downloadURL.RawQuery = c.query.Encode()
-
-	_, data, err := c.client.Get(c.downloadURL.String())
-	fmt.Println(string(data))
-	return err
-}
-
-// 创建目录
-func (c *Client) Mkdir(path string) (*File, error) {
-	c.baseURL.Path = filepath.Join(c.baseURL.Path, "file")
-
-	c.query.Set("method", "mkdir")
-	c.query.Set("path", path)
-	c.baseURL.RawQuery = c.query.Encode()
-
-	_, data, err := c.client.PostForm(c.baseURL.String(), nil)
+func (c *Client) Do(req *http.Request, v interface{}) (*http.Response, error) {
+	resp, err := c.client.Do(req)
 	if err != nil {
 		return nil, err
 	}
+	defer resp.Body.Close()
 
-	f := new(File)
-	err = json.Unmarshal(data, f)
+	err = CheckResponse(resp)
 	if err != nil {
-		return nil, err
+		// even though there was an error, we still return the response
+		// in case the caller wants to inspect it further
+		return resp, err
 	}
 
-	return f, nil
-}
-
-type FileMeta struct {
-	*File
-	BlockList   string `json:"block_list"`
-	IfHasSubDir uint   `json:"ifhassubdir"`
-}
-
-// 获取单个文件或目录的元信息。
-func (c *Client) GetMeta(path string) (*FileMeta, error) {
-	c.baseURL.Path = filepath.Join(c.baseURL.Path, "file")
-	c.query.Set("method", "meta")
-	c.query.Set("path", path)
-	c.baseURL.RawQuery = c.query.Encode()
-
-	_, data, err := c.client.Get(c.baseURL.String())
-	if err != nil {
-		return nil, err
-	}
-
-	f := new(FileMeta)
-	err = json.Unmarshal(data, f)
-	if err != nil {
-		return nil, err
-	}
-	return f, nil
-}
-
-// 批量获取文件/目录的元信息
-func (c *Client) BatchGetMeta(paths []string) ([]*FileMeta, error) {
-	c.baseURL.Path = filepath.Join(c.baseURL.Path, "file")
-
-	if len(paths) == 0 {
-		return nil, ErrInvalidArgument
-	}
-
-	paramMap := make(map[string][]map[string]string)
-	pathMap := make([]map[string]string, len(paths))
-	for i, p := range paths {
-		pathMap[i] = map[string]string{
-			"path": p,
+	if v != nil {
+		if w, ok := v.(io.Writer); ok {
+			io.Copy(w, resp.Body)
+		} else {
+			err = json.NewDecoder(resp.Body).Decode(v)
 		}
 	}
-	paramMap["list"] = pathMap
-	param, err := json.Marshal(paramMap)
-	if err != nil {
-		return nil, err
-	}
 
-	c.query.Set("method", "meta")
-	c.query.Set("param", string(param))
-	c.baseURL.RawQuery = c.query.Encode()
-
-	_, data, err := c.client.PostForm(c.baseURL.String(), nil)
-	if err != nil {
-		return nil, err
-	}
-
-	metas := struct {
-		List []*FileMeta `json:"list"`
-	}{}
-	err = json.Unmarshal(data, &metas)
-	if err != nil {
-		return nil, err
-	}
-
-	return metas.List, nil
+	return resp, err
 }
 
-// 获取目录下的文件列表
-// order: “asc”或“desc”，缺省采用降序排序
-// by: 排序字段，缺省根据文件类型排序：
-//     - time（修改时间）
-//     - name（文件名）
-//     - size（大小，注意目录无大小）
-// limit: 返回条目控制，参数格式为：n1-n2。
-//        返回结果集的[n1, n2)之间的条目，缺省返回所有条目；n1从0开始。
-func (c *Client) ListFiles(path, order, by, limit string) ([]*File, error) {
-	c.baseURL.Path = filepath.Join(c.baseURL.Path, "file")
-
-	c.query.Set("method", "list")
-	c.query.Set("path", path)
-	c.query.Set("by", by)
-	c.query.Set("limit", limit)
-	c.query.Set("order", order)
-	c.baseURL.RawQuery = c.query.Encode()
-	fmt.Println(c.baseURL.String())
-	_, data, err := c.client.Get(c.baseURL.String())
-	if err != nil {
-		return nil, err
-	}
-
-	files := struct {
-		List []*File `json:"list"`
-	}{}
-	err = json.Unmarshal(data, &files)
-	if err != nil {
-		return nil, err
-	}
-
-	return files.List, nil
+type ErrorResponse struct {
+	Response *http.Response // HTTP response that caused this error
+	Message  string         `json:"error_msg"`  // error message
+	Code     int            `json:"error_code"` // error code
 }
 
-func (c *Client) fileOp(method string, args ...string) (*http.Response, []byte, error) {
-	c.baseURL.Path = filepath.Join(c.baseURL.Path, "file")
-
-	c.query.Set("method", method)
-
-	switch method {
-	case "move", "copy":
-		c.query.Set("from", args[0])
-		c.query.Set("to", args[1])
-	case "delete":
-		c.query.Set("path", args[0])
-	}
-
-	c.baseURL.Path = c.query.Encode()
-	return c.client.PostForm(c.baseURL.String(), nil)
+func (r *ErrorResponse) Error() string {
+	return fmt.Sprintf("[%v] - %v - %d - %v - %d",
+		r.Response.Request.Method, r.Response.Request.URL,
+		r.Response.StatusCode, r.Message, r.Code)
 }
 
-// 移动单个文件/目录
-func (c *Client) Move(from, to string) error {
-	_, data, err := c.fileOp("move", from, to)
-	if err != nil {
-		return err
+func CheckResponse(r *http.Response) error {
+	if c := r.StatusCode; 200 <= c && c <= 299 {
+		return nil
 	}
-	//TODO: json unmarshal result.
-	fmt.Println(string(data))
-
-	return nil
-}
-
-// 拷贝单个文件/目录
-func (c *Client) Copy(from, to string) error {
-	_, data, err := c.fileOp("copy", from, to)
-	if err != nil {
-		return err
+	errorResponse := &ErrorResponse{Response: r}
+	data, err := ioutil.ReadAll(r.Body)
+	if err == nil && data != nil {
+		json.Unmarshal(data, errorResponse)
 	}
-
-	//TODO: json unmarshal result.
-	fmt.Println(string(data))
-
-	return nil
-}
-
-// 删除单个文件/目录
-func (c *Client) Delete(path string) error {
-	_, data, err := c.fileOp("delete", path)
-	if err != nil {
-		return err
-	}
-
-	fmt.Println(string(data))
-	// TODO marshal result
-
-	return nil
-}
-
-type Pair struct {
-	From string `json:"from"`
-	To   string `json:"to"`
-}
-
-func (c *Client) batchGeneric(method string, args interface{}) (*http.Response, []byte, error) {
-	c.baseURL.Path = filepath.Join(c.baseURL.Path, "file")
-
-	c.query.Set("method", method)
-
-	var err error
-	var param []byte
-
-	switch method {
-	case "move", "copy":
-		tmp := struct {
-			List []*Pair `json:"list"`
-		}{
-			List: args.([]*Pair),
-		}
-		param, err = json.Marshal(&tmp)
-	case "delete":
-		tmp := struct {
-			List []string `json:"list"`
-		}{
-			List: args.([]string),
-		}
-		param, err = json.Marshal(&tmp)
-	}
-	if err != nil {
-		return nil, nil, err
-	}
-
-	d := url.Values{}
-	d.Set("param", string(param))
-
-	return c.client.PostForm(c.baseURL.String(), d)
-}
-
-// 批量移动文件/目录
-func (c *Client) BatchMove(pairs []*Pair) error {
-	_, data, err := c.batchGeneric("move", pairs)
-	if err != nil {
-		return err
-	}
-
-	// TODO unmarshal result
-	fmt.Println(string(data))
-	return nil
-}
-
-// 批量拷贝文件/目录
-func (c *Client) BatchCopy(pairs []*Pair) error {
-	_, data, err := c.batchGeneric("copy", pairs)
-	if err != nil {
-		return err
-	}
-
-	// TODO unmarshal result
-	fmt.Println(string(data))
-	return nil
-}
-
-// 批量删除文件/目录
-func (c *Client) BatchDelete(paths []string) error {
-	_, data, err := c.batchGeneric("delete", paths)
-	if err != nil {
-		return err
-	}
-
-	fmt.Println(string(data))
-	// TODO: unmarshal data
-	return nil
-}
-
-// 按文件名搜索文件（不支持查找目录）。
-func (c *Client) Search(path string, word string, recursive bool) ([]*File, error) {
-	c.baseURL.Path = filepath.Join(c.baseURL.Path, "file")
-
-	var re string
-	if recursive {
-		re = "1"
-	} else {
-		re = "0"
-	}
-
-	c.query.Set("method", "search")
-	c.query.Set("path", path)
-	c.query.Set("wd", word)
-	c.query.Set("re", re)
-	c.baseURL.RawQuery = c.query.Encode()
-
-	_, data, err := c.client.Get(c.baseURL.String())
-	if err != nil {
-		return nil, err
-	}
-
-	files := struct {
-		List []*File `json:"list"`
-	}{}
-	err = json.Unmarshal(data, &files)
-	if err != nil {
-		return nil, err
-	}
-
-	return files.List, nil
-}
-
-// **高级功能**
-
-//获取指定图片文件的缩略图。
-// path: 源图片的路径。                               必选
-// height: 指定缩略图的高度，取值范围为(0,1600]。       必选
-// width: 指定缩略图的高度，取值范围为(0,1600]。        必选
-// quality: 缩略图的质量，默认为“100”，取值范围(0,100]。可选
-func (c *Client) Thumbnail(path string, height int, width int, quality int) error {
-	c.baseURL.Path = filepath.Join(c.baseURL.Path, "thumbnail")
-
-	c.query.Set("method", "generate")
-	c.query.Set("path", path)
-	c.query.Set("height", strconv.FormatInt(int64(height), 10))
-	c.query.Set("width", strconv.FormatInt(int64(width), 10))
-	c.query.Set("quality", strconv.FormatInt(int64(quality), 10))
-	c.baseURL.RawQuery = c.query.Encode()
-
-	_, data, err := c.client.Get(c.baseURL.String())
-	if err != nil {
-		return err
-	}
-
-	fmt.Println(string(data))
-	// TODO: 返回值？
-
-	return nil
-
-}
-
-// 增量更新查询
-// cursor: 用于标记更新断点。
-//  - 首次调用cursor=null；
-//  - 非首次调用，使用最后一次调用diff接口的返回结果中的cursor。
-func (c *Client) Diff(cursor string) error {
-	c.baseURL.Path = filepath.Join(c.baseURL.Path, "file")
-
-	c.query.Set("method", "diff")
-	c.query.Set("cursor", cursor)
-
-	c.baseURL.RawQuery = c.query.Encode()
-
-	_, data, err := c.client.Get(c.baseURL.String())
-	if err != nil {
-		return err
-	}
-
-	fmt.Println(string(data))
-	// TODO: unmarshal result
-
-	return nil
-}
-
-// 为当前用户进行视频转码并实现在线实时观看
-// path: 格式必须为m3u8,m3u,asf,avi,flv,gif,mkv,mov,mp4,m4a,3gp,3g2,mj2,mpeg,ts,rm,rmvb,webm
-// typ: 目前支持以下格式：
-//      M3U8_320_240、M3U8_480_224、M3U8_480_360、M3U8_640_480和M3U8_854_480
-func (c *Client) Streaming(path, typ string) error {
-	c.baseURL.Path = filepath.Join(c.baseURL.Path, "file")
-
-	c.query.Set("method", "streaming")
-	c.query.Set("path", path)
-	c.query.Set("type", typ)
-	c.baseURL.RawQuery = c.query.Encode()
-
-	_, data, err := c.client.Get(c.baseURL.String())
-	if err != nil {
-		return err
-	}
-
-	fmt.Println(string(data))
-
-	return nil
-}
-
-type StreamFile struct {
-	Total uint    `json:"total"`
-	Start uint    `json:"start"`
-	Limit uint    `json:"limit"`
-	List  []*File `json:"list"`
-}
-
-// 获取流式文件列表
-func (c *Client) ListStream(typ, start, limit, filterPath string) (*StreamFile, error) {
-	c.baseURL.Path = filepath.Join(c.baseURL.Path, "stream")
-
-	c.query.Set("method", "list")
-	c.query.Set("tpye", typ)
-	c.query.Set("start", start)
-	c.query.Set("limit", limit)
-	c.query.Set("filter_path", filterPath)
-	c.baseURL.RawQuery = c.query.Encode()
-
-	_, data, err := c.client.Get(c.baseURL.String())
-	if err != nil {
-		return nil, err
-	}
-
-	sf := new(StreamFile)
-	err = json.Unmarshal(data, sf)
-	if err != nil {
-		return nil, err
-	}
-	return sf, nil
-}
-
-// 下载流式文件
-func (c *Client) DownloadStream(path string) error {
-	c.downloadURL.Path = filepath.Join(c.downloadURL.Path, "file")
-
-	c.query.Set("method", "download")
-	c.query.Set("path", path)
-	c.downloadURL.RawQuery = c.query.Encode()
-
-	_, _, err := c.client.Get(c.downloadURL.String())
-
-	//TODO: 需注意处理好 302 跳转问题。
-
-	return err
-}
-
-// 计算文件的各种值
-func (c *Client) sumFile(path string) (contentLen int, contentMd5, sliceMd5 string, contentCrc32 uint32, err error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return 0, "", "", 0, err
-	}
-
-	buf := &bytes.Buffer{}
-	_, err = io.Copy(buf, f)
-	if err != nil {
-		return 0, "", "", 0, err
-	}
-
-	// 1
-	contentLen = buf.Len()
-
-	// 2
-	h := md5.New()
-	h.Write(buf.Bytes())
-	contentMd5 = fmt.Sprintf("%x", h.Sum(nil))
-
-	// 3
-	contentCrc32 = crc32.ChecksumIEEE(buf.Bytes())
-
-	// 4
-	slice := make([]byte, minRapidUploadFile)
-	_, err = buf.Read(slice)
-	if err != nil {
-		return 0, "", "", 0, err
-	}
-	h.Reset()
-	h.Write(slice)
-	sliceMd5 = fmt.Sprintf("%x", h.Sum(nil))
-
-	return contentLen, contentMd5, sliceMd5, contentCrc32, nil
-}
-
-// 秒传一个文件。
-func (c *Client) RapidUpload(srcPath, targetPath string, overwrite bool) (*File, error) {
-	c.baseURL.Path = filepath.Join(c.baseURL.Path, "file")
-
-	contentLength, contentMd5, sliceMd5, contentCrc32, err := c.sumFile(srcPath)
-	if err != nil {
-		return nil, err
-	}
-	if contentLength <= minRapidUploadFile {
-		return nil, ErrMinRapidFileSize
-	}
-
-	c.query.Set("method", "rapidupload")
-	c.query.Set("path", targetPath)
-	c.query.Set("content-length", strconv.FormatInt(int64(contentLength), 10))
-	c.query.Set("content-md5", contentMd5)
-	c.query.Set("slice-md5", sliceMd5)
-	c.query.Set("content-crc32", strconv.FormatUint(uint64(contentCrc32), 10))
-	c.query.Set("ondup", getOnDup(overwrite))
-
-	c.baseURL.RawQuery = c.query.Encode()
-
-	_, data, err := c.client.PostForm(c.baseURL.String(), nil)
-	if err != nil {
-		return nil, err
-	}
-
-	f := new(File)
-	err = json.Unmarshal(data, f)
-	if err != nil {
-		return nil, err
-	}
-
-	return f, nil
-}
-
-// 添加离线下载任务
-// savePath: 下载后的文件保存路径           必选
-// sourceURL: 源文件的URL                  必选
-// callback: 下载完毕后的回调，默认为空      可选
-// expires: 请求失效时间，如果有，则会校验。  可选
-// rateLimit: 下载限速，默认不限速
-func (c *Client) AddOfflineDownloadTask(savePath, sourceURL, callback string, expires, rateLimit, timeout int64) (int64, error) {
-	c.baseURL.Path = filepath.Join(c.baseURL.Path, "services/cloud_dl")
-
-	c.query.Set("method", "add_task")
-	c.query.Set("expires", strconv.FormatInt(expires, 10))
-	c.query.Set("save_path", savePath)
-	c.query.Set("source_url", sourceURL)
-	c.query.Set("rate_limit", strconv.FormatInt(rateLimit, 10))
-	c.query.Set("timeout", strconv.FormatInt(timeout, 10))
-	c.query.Set("callback", callback)
-	c.baseURL.RawQuery = c.query.Encode()
-
-	_, data, err := c.client.PostForm(c.baseURL.String(), nil)
-	if err != nil {
-		return 0, err
-	}
-
-	result := struct {
-		TaskId int64 `json:"task_id"`
-	}{}
-
-	err = json.Unmarshal(data, &result)
-	if err != nil {
-		return 0, err
-	}
-
-	return result.TaskId, nil
-}
-
-// 精确查询离线下载任务
-func (c *Client) QueryOfflineDownloadTask(taskIds []int64, expires int64, opType int8) error {
-	if opType != int8(0) || opType != int8(1) {
-		return ErrInvalidArgument
-	}
-	c.baseURL.Path = filepath.Join(c.baseURL.Path, "service/cloud_dl")
-
-	ids := make([]string, len(taskIds))
-	for i, id := range taskIds {
-		ids[i] = strconv.FormatInt(id, 10)
-	}
-	idsStr := strings.Join(ids, ",")
-
-	c.query.Set("method", "query_task")
-	c.query.Set("expires", strconv.FormatInt(expires, 10))
-	c.query.Set("task_ids", idsStr)
-	c.query.Set("op_type", strconv.FormatInt(int64(opType), 10))
-	c.baseURL.RawQuery = c.query.Encode()
-
-	_, data, err := c.client.PostForm(c.baseURL.String(), nil)
-	if err != nil {
-		return err
-	}
-
-	fmt.Println(string(data))
-	//TODO: unmarshal result
-
-	return nil
-}
-
-// 查询离线下载任务列表
-func (c *Client) ListOfflineDownloadTask() error {
-	c.baseURL.Path = filepath.Join(c.baseURL.Path, "service/cloud_dl")
-
-	c.query.Set("method", "list_task")
-
-	// TODO:  补充其他可选参数
-	c.baseURL.RawQuery = c.query.Encode()
-
-	_, data, err := c.client.PostForm(c.baseURL.String(), nil)
-	if err != nil {
-		return err
-	}
-
-	fmt.Println(string(data))
-	// TODO: unmarshal result
-
-	return nil
-
-}
-
-// 取消离线下载任务
-func (c *Client) CancelOfflineDownloadTask(taskId int64) error {
-	c.baseURL.Path = filepath.Join(c.baseURL.Path, "service/cloud_dl")
-
-	c.query.Set("method", "cancel_task")
-	c.query.Set("task_ids", strconv.FormatInt(taskId, 10))
-	// TODO:  补充其他可选参数
-
-	c.baseURL.RawQuery = c.query.Encode()
-
-	_, data, err := c.client.PostForm(c.baseURL.String(), nil)
-	if err != nil {
-		return err
-	}
-
-	fmt.Println(string(data))
-	// TODO: unmarshal result
-
-	return nil
-
-}
-
-// **回收站相关**
-
-// 查询回收站文件,获取回收站中的文件及目录列表
-func (c *Client) ListRecycle(start, limit int64) error {
-	c.baseURL.Path = filepath.Join(c.baseURL.Path, "file")
-
-	c.query.Set("method", "listrecycle")
-	c.query.Set("start", strconv.FormatInt(start, 10))
-	c.query.Set("limit", strconv.FormatInt(limit, 10))
-	c.baseURL.RawQuery = c.query.Encode()
-
-	_, data, err := c.client.Get(c.baseURL.String())
-	if err != nil {
-		return err
-	}
-	fmt.Println(string(data))
-	// TODO: unmarshal result
-
-	return nil
-
-}
-
-// 还原单个文件或目录
-func (c *Client) Restore(fsId string) error {
-	c.baseURL.Path = filepath.Join(c.baseURL.Path, "file")
-
-	c.query.Set("method", "restore")
-	c.query.Set("fs_id", fsId)
-	c.baseURL.RawQuery = c.query.Encode()
-
-	_, data, err := c.client.PostForm(c.baseURL.String(), nil)
-	if err != nil {
-		return err
-	}
-	fmt.Println(string(data))
-	// TODO: unmarshal result
-	return nil
-
-}
-
-// 批量还原文件或目录
-func (c *Client) BatchRestore(fsIds []string) error {
-	c.baseURL.Path = filepath.Join(c.baseURL.Path, "file")
-
-	c.query.Set("method", "restore")
-	c.baseURL.RawQuery = c.query.Encode()
-
-	paramMap := make(map[string][]map[string]string)
-	fsIdMap := make([]map[string]string, len(fsIds))
-	for i, p := range fsIds {
-		fsIdMap[i] = map[string]string{
-			"fs_id": p,
-		}
-	}
-	paramMap["list"] = fsIdMap
-	param, err := json.Marshal(paramMap)
-	if err != nil {
-		return err
-	}
-
-	d := url.Values{}
-	d.Set("param", string(param))
-
-	_, data, err := c.client.PostForm(c.baseURL.String(), d)
-	if err != nil {
-		return err
-	}
-
-	fmt.Println(string(data))
-	// TODO: unmarshal result
-
-	return nil
-}
-
-// 清空回收站
-func (c *Client) EmptyRecycle() error {
-	c.baseURL.Path = filepath.Join(c.baseURL.Path, "file")
-
-	c.query.Set("method", "delete")
-	c.query.Set("type", "recycle")
-	c.baseURL.RawQuery = c.query.Encode()
-
-	_, data, err := c.client.PostForm(c.baseURL.String(), nil)
-	if err != nil {
-		return err
-	}
-
-	fmt.Println(data)
-	// TODO: unmarshal result
-
-	return nil
+	return errorResponse
 }
