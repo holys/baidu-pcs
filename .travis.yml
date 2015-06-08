@@ -8,4 +8,4 @@ branches:
   only:
     - master
 
-script: github.com/google/go-querystring
+script: go get github.com/google/go-querystring
