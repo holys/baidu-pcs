@@ -13,7 +13,7 @@ func main() {
 		panic("token not found")
 	}
 	client := pcs.NewClient(token)
-	quota, err := client.GetQuota()
+	quota, _, err := client.GetQuota()
 	if err != nil {
 		return
 	}
