@@ -8,5 +8,4 @@ branches:
   only:
     - master
 
-install:
-  - github.com/google/go-querystring
+script: github.com/google/go-querystring
