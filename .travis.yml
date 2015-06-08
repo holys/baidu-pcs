@@ -1,0 +1,12 @@
+language: go
+
+go:
+  - 1.3
+  - tip
+
+branches:
+  only:
+    - master
+
+install:
+  - github.com/google/go-querystring/query
