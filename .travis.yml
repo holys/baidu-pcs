@@ -9,4 +9,4 @@ branches:
     - master
 
 install:
-  - github.com/google/go-querystring/query
+  - github.com/google/go-querystring
